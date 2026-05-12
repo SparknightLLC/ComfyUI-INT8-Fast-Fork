@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 
 import comfy.sd
@@ -6,6 +7,35 @@ import comfy.utils
 import folder_paths
 import torch
 from comfy.cli_args import args
+
+
+def _install_lazy_casting_param_workaround():
+	try:
+		import comfy.model_patcher as comfy_model_patcher
+	except Exception:
+		return None
+
+	lazy_param_cls = getattr(comfy_model_patcher, "LazyCastingParam", None)
+	if lazy_param_cls is None:
+		return None
+
+	original_new = getattr(lazy_param_cls, "__new__", None)
+	if original_new is None:
+		return None
+
+	def _safe_new(cls, model, key, tensor):
+		requires_grad = bool(
+			isinstance(tensor, torch.Tensor)
+			and (tensor.is_floating_point() or tensor.is_complex())
+		)
+		return torch.nn.Parameter.__new__(cls, tensor, requires_grad=requires_grad)
+
+	lazy_param_cls.__new__ = staticmethod(_safe_new)
+
+	def _restore():
+		lazy_param_cls.__new__ = original_new
+
+	return _restore
 
 
 def _is_int8_quantized_module(module):
@@ -17,6 +47,35 @@ def _is_int8_quantized_module(module):
 		return False
 
 	return weight.dtype == torch.int8
+
+
+def _module_has_non_float_weight(module):
+	weight = getattr(module, "weight", None)
+	if not isinstance(weight, torch.Tensor):
+		return False
+	if weight.is_floating_point() or weight.is_complex():
+		return False
+	return True
+
+
+def _resolve_patch_target_module(base_model, patch_key):
+	try:
+		return comfy.utils.get_attr(base_model, patch_key)
+	except Exception:
+		pass
+
+	diffusion_model = getattr(base_model, "diffusion_model", None)
+	if diffusion_model is None:
+		return None
+
+	trimmed_key = patch_key
+	if trimmed_key.startswith("diffusion_model."):
+		trimmed_key = trimmed_key[len("diffusion_model."):]
+
+	try:
+		return comfy.utils.get_attr(diffusion_model, trimmed_key)
+	except Exception:
+		return None
 
 
 def _collect_modules_for_save_workaround(model_patcher):
@@ -47,11 +106,7 @@ def _collect_modules_for_save_workaround(model_patcher):
 			if not _is_int8_quantized_module(patch_obj):
 				continue
 
-			try:
-				target_module = comfy.utils.get_attr(base_model, patch_key)
-			except Exception:
-				target_module = None
-
+			target_module = _resolve_patch_target_module(base_model, patch_key)
 			if target_module is None:
 				continue
 
@@ -60,6 +115,20 @@ def _collect_modules_for_save_workaround(model_patcher):
 				continue
 			seen_module_ids.add(module_id)
 			modules.append(target_module)
+
+	diffusion_model = getattr(base_model, "diffusion_model", None)
+	if diffusion_model is not None and hasattr(diffusion_model, "named_modules"):
+		for _, module in diffusion_model.named_modules():
+			if not getattr(module, "comfy_cast_weights", False):
+				continue
+			if not _module_has_non_float_weight(module):
+				continue
+
+			module_id = id(module)
+			if module_id in seen_module_ids:
+				continue
+			seen_module_ids.add(module_id)
+			modules.append(module)
 
 	return modules
 
@@ -126,12 +195,20 @@ class INT8ModelSave:
 		output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
 
 		modules_to_patch = _collect_modules_for_save_workaround(model)
+		if not modules_to_patch:
+			logging.warning("INT8 Model Save: no target modules were found for DynamicVRAM save workaround.")
+		else:
+			print(f"[INT8 Model Save] Applying DynamicVRAM save workaround on {len(modules_to_patch)} module(s).")
 		flag_states = _set_comfy_patched_weights_flag(modules_to_patch)
+		restore_lazy_param = _install_lazy_casting_param_workaround()
+		if restore_lazy_param is not None:
+			print("[INT8 Model Save] Enabled temporary LazyCastingParam requires_grad workaround.")
 
 		try:
 			comfy.sd.save_checkpoint(output_checkpoint, model, metadata=metadata)
 		finally:
+			if restore_lazy_param is not None:
+				restore_lazy_param()
 			_restore_comfy_patched_weights_flag(flag_states)
 
 		return {}
-
