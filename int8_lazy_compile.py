@@ -84,7 +84,7 @@ def _uses_flux_global_modulation(diffusion_model):
 
 def _should_force_whole_model_compile(model_patcher, diffusion_model):
 	model_type = _get_int8_adapter_model_type(model_patcher)
-	if model_type == "flux2":
+	if model_type in ("flux2", "flux2_fast_unsafe"):
 		return True
 	return _uses_flux_global_modulation(diffusion_model)
 

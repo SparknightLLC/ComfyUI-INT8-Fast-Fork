@@ -29,6 +29,8 @@ from .int8_quant import (
 	quantize_int8_rowwise,
 )
 from .int8_unet_loader import MODEL_TYPE_CHOICES as LOADER_MODEL_TYPE_CHOICES
+from .int8_unet_loader import MODEL_TYPE_FLUX2_FAST_UNSAFE
+from .int8_unet_loader import MODEL_TYPE_HIDREAM_O1
 from .int8_unet_loader import OUTLIER_METHOD_CHOICES
 from .int8_unet_loader import DEFAULT_OUTLIER_METHOD
 from .int8_unet_loader import get_model_type_exclusions
@@ -58,6 +60,12 @@ MODEL_TYPE_FINGERPRINTS = {
 		"double_stream_modulation_img",
 		"double_stream_modulation_txt",
 		"single_stream_modulation",
+	),
+	MODEL_TYPE_HIDREAM_O1: (
+		"embed",
+		"language_model",
+		"language_model.layers",
+		"language_model.layers.35.mlp",
 	),
 	"z-image": (
 		"cap_embedder",
@@ -106,6 +114,7 @@ MODEL_TYPE_FINGERPRINTS = {
 
 MODEL_TYPE_REQUIRED_MARKERS = {
 	"flux2": ("guidance_in", "double_stream_modulation_img", "double_stream_modulation_txt"),
+	MODEL_TYPE_HIDREAM_O1: ("language_model.layers",),
 	"z-image": ("cap_embedder", "context_refiner", "noise_refiner"),
 	"wan": ("patch_embedding", "time_projection"),
 	"ltx2": ("audio_adaln_single", "audio_caption_projection", "audio_patchify_proj"),
@@ -268,6 +277,23 @@ def _is_supported_linear(module):
 		return False
 	weight = getattr(module, "weight", None)
 	return _is_supported_weight_tensor(weight)
+
+
+def _is_supported_linear_fast_unsafe(module):
+	if isinstance(module, Int8TensorwiseOps.Linear):
+		return False
+	if getattr(module, "_is_quantized", False):
+		return False
+	if not _is_linear_like(module):
+		return False
+	weight = getattr(module, "weight", None)
+	if not isinstance(weight, torch.Tensor):
+		return False
+	if weight.ndim != 2:
+		return False
+	if weight.shape[0] <= 1 or weight.shape[1] <= 1:
+		return False
+	return weight.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight.dtype)
 
 
 def _collect_layer_patch_keys(model_patcher, module_name):
@@ -574,13 +600,14 @@ def _drop_torch_compile_wrapper(model_patcher):
 	return isinstance(compile_kwargs, dict)
 
 
-def _collect_int8_candidates(diffusion_model, excluded_names):
+def _collect_int8_candidates(diffusion_model, excluded_names, fast_unsafe=False):
+	is_supported = _is_supported_linear_fast_unsafe if fast_unsafe else _is_supported_linear
 	return [
 		(module_name, module)
 		for module_name, module in diffusion_model.named_modules()
 		if module_name
 		and not _is_excluded(module_name, excluded_names)
-		and _is_supported_linear(module)
+		and is_supported(module)
 	]
 
 
@@ -676,7 +703,7 @@ class INT8ModelAdapter:
 			"required": {
 				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to this extension's INT8 linear runtime."}),
 				"enable_int8": ("BOOLEAN", {"default": True, "tooltip": "Disable this to pass the input model through unchanged without removing the node from a workflow."}),
-				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. Auto inspects the loaded MODEL. Use none only for experiments."}),
+				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. Auto inspects the loaded MODEL. flux2_fast_unsafe is opt-in and uses less defensive targeting. Use none only for experiments."}),
 				"outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply before quantizing compatible layers. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
 				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
 				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for INT8 linear layers. torch_int_mm is the default and uses PyTorch torch._int_mm with tiny-row padding for CUDA compatibility; triton uses this extension's fused Triton kernels and may be faster on some model shapes; triton_legacy_unsafe reproduces the old upstream edge-tile behavior for diagnostics only and may be incorrect on tail shapes."}),
@@ -703,11 +730,26 @@ class INT8ModelAdapter:
 		bake_loaded_loras=True,
 		log_progress=True,
 		use_triton=None,
-	):
+		):
 		if not enable_int8:
 			return (model,)
 
-		model_patcher = model.clone()
+		source_model_patcher = model
+		source_diffusion_model = getattr(source_model_patcher.model, "diffusion_model", None)
+		if source_diffusion_model is None:
+			logging.warning("INT8 Model Adapter: model has no diffusion_model; returning unchanged model.")
+			return (source_model_patcher,)
+
+		resolved_model_type, excluded_names = _resolve_model_type_and_exclusions(
+			model_type,
+			source_diffusion_model,
+			bool(log_progress),
+		)
+		fast_unsafe_targeting = resolved_model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE
+		if runtime_backend not in INT8_BACKEND_CHOICES:
+			runtime_backend = DEFAULT_INT8_BACKEND
+
+		model_patcher = source_model_patcher.clone()
 		restored_prior_patch_count = _reset_prior_int8_object_patches(model_patcher)
 		_clear_prior_int8_object_patches(model_patcher)
 		diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
@@ -715,29 +757,48 @@ class INT8ModelAdapter:
 			logging.warning("INT8 Model Adapter: model has no diffusion_model; returning unchanged model.")
 			return (model_patcher,)
 
-		resolved_model_type, excluded_names = _resolve_model_type_and_exclusions(
-			model_type,
-			diffusion_model,
-			bool(log_progress),
-		)
-		if runtime_backend not in INT8_BACKEND_CHOICES:
-			runtime_backend = DEFAULT_INT8_BACKEND
 		Int8TensorwiseOps.small_batch_fallback_mode = small_batch_fallback
 		Int8TensorwiseOps.runtime_backend = runtime_backend
 		Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
 		Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
 		Int8TensorwiseOps.prepack_int8_weights = bool(prepack_int8_weights)
 
-		candidates = _collect_int8_candidates(diffusion_model, excluded_names)
+		if log_progress and fast_unsafe_targeting:
+			print(
+				"[INT8 Model Adapter] flux2_fast_unsafe selected; using upstream-style plain nn.Linear "
+				"targeting and the less conservative Flux2 exclusion preset."
+			)
+
+		candidates = _collect_int8_candidates(
+			diffusion_model,
+			excluded_names,
+			fast_unsafe=fast_unsafe_targeting,
+		)
 		if not candidates:
 			try:
 				if log_progress:
 					print("[INT8 Model Adapter] No eligible layers found on first scan; forcing model load and rescanning.")
 				comfy.model_management.load_models_gpu([model_patcher], force_patch_weights=True, force_full_load=True)
 				diffusion_model = getattr(model_patcher.model, "diffusion_model", diffusion_model)
-				candidates = _collect_int8_candidates(diffusion_model, excluded_names)
+				candidates = _collect_int8_candidates(
+					diffusion_model,
+					excluded_names,
+					fast_unsafe=fast_unsafe_targeting,
+				)
 			except Exception as e:
 				logging.warning(f"INT8 Model Adapter: forced model load failed during candidate scan ({e}).")
+
+		if fast_unsafe_targeting and not candidates:
+			candidates = _collect_int8_candidates(
+				diffusion_model,
+				excluded_names,
+				fast_unsafe=False,
+			)
+			if log_progress and candidates:
+				print(
+					"[INT8 Model Adapter] flux2_fast_unsafe found no raw fast candidates; "
+					"falling back to Comfy linear-like targeting for quantization."
+				)
 
 		if candidates:
 			_remember_original_linear_modules(model_patcher, candidates)
@@ -819,6 +880,7 @@ class INT8ModelAdapter:
 			"small_batch_fallback": small_batch_fallback,
 			"runtime_backend": runtime_backend,
 			"prepack_int8_weights": bool(prepack_int8_weights),
+			"fast_unsafe_targeting": bool(fast_unsafe_targeting),
 			"log_progress": bool(log_progress),
 			"quantized_layers": quantized,
 			"baked_lora_layers": baked_lora_count,

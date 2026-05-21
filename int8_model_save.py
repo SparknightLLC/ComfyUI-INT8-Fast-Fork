@@ -15,25 +15,37 @@ def _install_lazy_casting_param_workaround():
 	except Exception:
 		return None
 
-	lazy_param_cls = getattr(comfy_model_patcher, "LazyCastingParam", None)
-	if lazy_param_cls is None:
-		return None
+	lazy_param_classes = [
+		getattr(comfy_model_patcher, "LazyCastingParam", None),
+		getattr(comfy_model_patcher, "LazyCastingParamPiece", None),
+	]
+	original_new_methods = []
 
-	original_new = getattr(lazy_param_cls, "__new__", None)
-	if original_new is None:
-		return None
-
-	def _safe_new(cls, model, key, tensor):
+	def _safe_new(cls, *args, **kwargs):
+		tensor = kwargs.get("tensor", None)
+		if tensor is None and args:
+			tensor = args[-1]
 		requires_grad = bool(
 			isinstance(tensor, torch.Tensor)
 			and (tensor.is_floating_point() or tensor.is_complex())
 		)
 		return torch.nn.Parameter.__new__(cls, tensor, requires_grad=requires_grad)
 
-	lazy_param_cls.__new__ = staticmethod(_safe_new)
+	for lazy_param_cls in lazy_param_classes:
+		if lazy_param_cls is None:
+			continue
+		original_new = getattr(lazy_param_cls, "__new__", None)
+		if original_new is None:
+			continue
+		original_new_methods.append((lazy_param_cls, original_new))
+		lazy_param_cls.__new__ = staticmethod(_safe_new)
+
+	if not original_new_methods:
+		return None
 
 	def _restore():
-		lazy_param_cls.__new__ = original_new
+		for lazy_param_cls, original_new in original_new_methods:
+			lazy_param_cls.__new__ = original_new
 
 	return _restore
 
@@ -185,6 +197,9 @@ class INT8ModelSave:
 			prompt_info = json.dumps(prompt)
 
 		metadata = {}
+		source_metadata = getattr(model, "_safetensors_metadata", None)
+		if isinstance(source_metadata, dict):
+			metadata.update(source_metadata)
 		if not args.disable_metadata:
 			metadata["prompt"] = prompt_info
 			if extra_pnginfo is not None:
@@ -193,6 +208,10 @@ class INT8ModelSave:
 
 		output_checkpoint = f"{filename}_{counter:05}_.safetensors"
 		output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
+
+		finalize_pending_int8 = getattr(model, "finalize_pending_int8", None)
+		if callable(finalize_pending_int8):
+			finalize_pending_int8()
 
 		modules_to_patch = _collect_modules_for_save_workaround(model)
 		if not modules_to_patch:

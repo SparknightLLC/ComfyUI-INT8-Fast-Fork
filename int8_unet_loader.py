@@ -14,14 +14,35 @@ from .int8_quant import (
 )
 
 
-MODEL_TYPE_CHOICES = ["anima", "chroma", "ernie", "flux2", "ltx2", "qwen", "sdxl", "wan", "z-image"]
+MODEL_TYPE_FLUX2 = "flux2"
+MODEL_TYPE_FLUX2_FAST_UNSAFE = "flux2_fast_unsafe"
+MODEL_TYPE_HIDREAM_O1 = "hidream o1"
+MODEL_TYPE_CHOICES = [
+    "anima",
+    "chroma",
+    "ernie",
+    MODEL_TYPE_FLUX2,
+    MODEL_TYPE_FLUX2_FAST_UNSAFE,
+    MODEL_TYPE_HIDREAM_O1,
+    "ltx2",
+    "qwen",
+    "sdxl",
+    "wan",
+    "z-image",
+]
 DEFAULT_OUTLIER_METHOD = OUTLIER_METHOD_NONE
 
 
 def get_model_type_exclusions(model_type):
-    if model_type == "flux2":
+    if model_type == MODEL_TYPE_FLUX2:
         return [
             "img_in", "time_in", "guidance_in", "txt_in", "final_layer",
+            "double_stream_modulation_img", "double_stream_modulation_txt",
+            "single_stream_modulation",
+        ]
+    if model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE:
+        return [
+            "img_in", "time_in", "guidance_in", "txt_in",
             "double_stream_modulation_img", "double_stream_modulation_txt",
             "single_stream_modulation",
         ]
@@ -48,6 +69,10 @@ def get_model_type_exclusions(model_type):
         return [
             "embed", "llm", "adaln",
         ]
+    if model_type == MODEL_TYPE_HIDREAM_O1:
+        return [
+            "embed", "language_model.layers.35.mlp",
+        ]
     if model_type == "sdxl":
         return [
             "time_embed", "label_emb", "emb_layers", "proj_in", "proj_out",
@@ -66,6 +91,18 @@ def get_model_type_exclusions(model_type):
     return []
 
 
+def _read_safetensors_metadata(path):
+    if not isinstance(path, str) or not path.lower().endswith(".safetensors"):
+        return None
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+            return dict(metadata) if isinstance(metadata, dict) else None
+    except Exception:
+        return None
+
+
 class UNetLoaderINTW8A8:
     """
     Load INT8 tensorwise quantized diffusion models.
@@ -80,7 +117,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "Diffusion model checkpoint to load from ComfyUI's diffusion_models folder."}),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"], {"tooltip": "Requested source weight dtype passed to ComfyUI during model construction. INT8 checkpoints still load as INT8 when weight_scale tensors are present."}),
-                "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize."}),
+                "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. flux2_fast_unsafe is opt-in and less conservative."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights to INT8 during loading. Leave off for already-quantized INT8 checkpoints."}),
                 "outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply during on-the-fly INT8 quantization. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
                 "small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
@@ -137,9 +174,14 @@ class UNetLoaderINTW8A8:
         
         # Check explicit model_type for exclusions
         Int8TensorwiseOps.excluded_names = get_model_type_exclusions(model_type)
+        if on_the_fly_quantization and model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE:
+            print("[INT8 Loader] flux2_fast_unsafe selected; using the less conservative Flux2 exclusion preset.")
 
         # Load model directly - Int8TensorwiseOps handles int8 weights natively
         model = load_diffusion_model(unet_path, model_options=model_options)
+        metadata = _read_safetensors_metadata(unet_path)
+        if metadata is not None:
+            model._safetensors_metadata = metadata
 
         if on_the_fly_quantization:
             Int8TensorwiseOps.summarize_otf_progress()

@@ -63,7 +63,7 @@ Converts an already-loaded diffusion `MODEL` to INT8 by object-patching eligible
 
 Settings:
 
-- `model_type`: defaults to `auto`, which inspects the loaded `MODEL` and selects a known exclusion preset when possible. Use a specific preset to override detection. Use `none` only for experiments because it disables preset exclusions.
+- `model_type`: defaults to `auto`, which inspects the loaded `MODEL` and selects a known exclusion preset when possible. Use a specific preset to override detection. Use `flux2_fast_unsafe` only when you want faster upstream-style Flux2/Klein targeting and can tolerate skipped/wrong layer targeting risk. Use `none` only for experiments because it disables preset exclusions.
 - `outlier_method`: choose `none`, `quarot`, or `hadanorm`. `none` is fastest. `quarot` applies Hadamard rotation for compatible layers. `hadanorm` adds static per-channel scaling, Hadamard mixing, dynamic centering, and a runtime correction term.
 - `small_batch_fallback`: defaults to `only_small_layers`. This falls back to fp16/bf16 math for tiny activation row counts only when the layer has `out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS` (default `1000000`). `always` may help very small row counts but often slows larger layers because it dequantizes full weights. `never` forces the selected INT8 backend.
 - `runtime_backend`: defaults to `torch_int_mm`. `torch_int_mm` uses PyTorch `torch._int_mm` with CUDA padding for tiny row counts and non-8-aligned output columns. `triton` uses this extension's fused Triton kernels and may be faster on some model shapes. `triton_legacy_unsafe` reproduces old upstream edge-tile behavior for diagnostics only and may produce incorrect output on tail shapes.
@@ -85,11 +85,15 @@ Supported `model_type` presets:
 - `chroma`
 - `ernie`
 - `flux2`
+- `flux2_fast_unsafe`
+- `hidream o1`
 - `ltx2`
 - `qwen`
 - `sdxl`
 - `wan`
 - `z-image`
+
+`flux2_fast_unsafe` is opt-in. In `Enable INT8 on MODEL`, it uses the less conservative upstream-style Flux2 exclusion list and first tries a faster raw linear-like scan; if that would find no layers in a stock-loaded Comfy object graph, it falls back to normal Comfy linear-like targeting so the preset does not become a no-op.
 
 > [!NOTE]
 > SDXL can be slower with INT8 enabled because only linear layers are quantized while convolutional UNet blocks, attention kernels, and other non-INT8 work still dominate runtime. Larger transformer-heavy architectures are more likely to benefit.
@@ -195,6 +199,8 @@ Recommended defaults:
 - Use `dynamic=true` when changing image size or batch shape. Try `dynamic=false` only for fixed workflows.
 - After source-code hot reloads or failed compile experiments, restart ComfyUI before drawing conclusions. TorchDynamo guards and generated kernels can outlive local Python edits inside the same process.
 
+If you launch ComfyUI through this project's `run.bat`, TorchInductor and Triton compile artifacts are stored under the local `torch_compile_cache` directory.
+
 ## ModelSave Round Trip
 
 If you quantize with `on_the_fly_quantization` and save with ComfyUI `ModelSave`, the saved checkpoint can be loaded back with `Load Diffusion Model INT8 (W8A8)` without re-quantizing as long as the checkpoint includes INT8 `weight` tensors and matching `weight_scale` tensors.
@@ -227,7 +233,7 @@ Additional checkpoints:
 - PyTorch build compatible with your ComfyUI install
 - `triton-windows` for the optional fused Triton backend on Windows
 
-Windows note: use the Triton build that matches your PyTorch/CUDA stack. In my tested Comfy Anaconda environment, PyTorch `2.8.0+cu126` imports Triton `3.4.0` from `triton-windows 3.4.0.post21`.
+Windows note: use the Triton build that matches your PyTorch/CUDA stack. In the tested Comfy Anaconda environment, PyTorch `2.8.0+cu126` imports Triton `3.4.0` from `triton-windows 3.4.0.post21`.
 
 ## Recent Development Changes
 
@@ -244,6 +250,7 @@ Windows note: use the Triton build that matches your PyTorch/CUDA stack. In my t
 - Improved cache-reuse logs and runtime diagnostics.
 - Reordered node inputs so `bake_loaded_loras` and logging controls are near the bottom.
 - Alphabetized model type lists with `auto` first and `none` last where applicable.
+- Added `hidream o1` and opt-in `flux2_fast_unsafe` presets.
 
 ## Credits
 
