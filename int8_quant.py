@@ -193,12 +193,20 @@ def _get_prepacked_weight(linear_module, device: torch.device):
 def _torch_int_mm_safe(a: Tensor, b: Tensor) -> Tensor:
     rows = int(a.shape[0])
     columns = int(b.shape[1])
+    inner = int(a.shape[1])
 
     if a.is_cuda and a.shape[0] <= 16:
         pad_rows = 17 - rows
         if pad_rows > 0:
             padding = torch.zeros((pad_rows, a.shape[1]), device=a.device, dtype=a.dtype)
             a = torch.cat((a, padding), dim=0)
+
+    if a.is_cuda and inner > 0 and (inner % 8) != 0:
+        pad_inner = 8 - (inner % 8)
+        a_padding = torch.zeros((a.shape[0], pad_inner), device=a.device, dtype=a.dtype)
+        b_padding = torch.zeros((pad_inner, b.shape[1]), device=b.device, dtype=b.dtype)
+        a = torch.cat((a, a_padding), dim=1)
+        b = torch.cat((b, b_padding), dim=0)
 
     if b.is_cuda and (columns % 8) != 0:
         pad_columns = 8 - (columns % 8)

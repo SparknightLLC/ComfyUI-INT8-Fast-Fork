@@ -8,6 +8,8 @@ import torch
 _LAZY_COMPILE_WRAPPER_KEY = "int8_lazy_torch_compile"
 _TORCH_COMPILE_KWARGS = "torch_compile_kwargs"
 _WHOLE_MODEL_COMPILE_KEY_LIST = ["diffusion_model"]
+_LAZY_COMPILE_OUTPUT_CACHE_KEY = "int8_lazy_compile_output_cache"
+_LAZY_COMPILE_OUTPUT_CACHE = {}
 
 
 def _skip_transformer_options_guards(guard_entries):
@@ -89,6 +91,49 @@ def _should_force_whole_model_compile(model_patcher, diffusion_model):
 	return _uses_flux_global_modulation(diffusion_model)
 
 
+def _get_output_cache(shared_model):
+	cache = getattr(shared_model, _LAZY_COMPILE_OUTPUT_CACHE_KEY, None)
+	if not isinstance(cache, dict):
+		cache = _LAZY_COMPILE_OUTPUT_CACHE
+		setattr(shared_model, _LAZY_COMPILE_OUTPUT_CACHE_KEY, cache)
+	return cache
+
+
+def _build_cache_key(
+	model_patcher,
+	backend,
+	fullgraph,
+	mode,
+	dynamic,
+	compile_transformer_blocks_only,
+	dynamo_cache_size_limit,
+	use_guard_filter,
+	disable_dynamic_vram,
+	log_compile,
+):
+	return (
+		"v1",
+		id(getattr(model_patcher, "model", None)),
+		getattr(model_patcher, "patches_uuid", None),
+		str(backend),
+		bool(fullgraph),
+		str(mode),
+		str(dynamic),
+		bool(compile_transformer_blocks_only),
+		int(dynamo_cache_size_limit),
+		bool(use_guard_filter),
+		bool(disable_dynamic_vram),
+		bool(log_compile),
+	)
+
+
+def _remember_cached_output(shared_model, cache_key, model_patcher):
+	cache = _get_output_cache(shared_model)
+	cache[cache_key] = model_patcher
+	while len(cache) > 8:
+		cache.pop(next(iter(cache)))
+
+
 def _make_lazy_compile_wrapper(compile_key_list, compile_kwargs, log_compile):
 	compiled_modules = {}
 	compile_failed = False
@@ -163,6 +208,22 @@ class INT8LazyTorchCompile:
 		disable_dynamic_vram,
 		log_compile,
 	):
+		cache_key = _build_cache_key(
+			model,
+			backend,
+			fullgraph,
+			mode,
+			dynamic,
+			compile_transformer_blocks_only,
+			dynamo_cache_size_limit,
+			use_guard_filter,
+			disable_dynamic_vram,
+			log_compile,
+		)
+		cached_model_patcher = _get_output_cache(model.model).get(cache_key)
+		if cached_model_patcher is not None:
+			return (cached_model_patcher,)
+
 		try:
 			model_patcher = model.clone(disable_dynamic=bool(disable_dynamic_vram))
 		except TypeError:
@@ -214,6 +275,7 @@ class INT8LazyTorchCompile:
 			"keys": compile_key_list,
 		}
 
+		_remember_cached_output(model.model, cache_key, model_patcher)
 		return (model_patcher,)
 
 

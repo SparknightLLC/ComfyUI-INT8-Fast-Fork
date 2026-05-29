@@ -25,6 +25,7 @@ LORA_MODE_STOCHASTIC = "Stochastic"
 LORA_MODE_DYNAMIC = "Dynamic"
 LORA_MODE_STANDARD = "Standard"
 LORA_MODE_CHOICES = [LORA_MODE_STOCHASTIC, LORA_MODE_DYNAMIC, LORA_MODE_STANDARD]
+INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
 
 
 def _is_plain_lora_adapter(adapter):
@@ -80,6 +81,23 @@ def _get_weight_scale_for_module(target_module):
 	if isinstance(weight_scale, torch.Tensor):
 		return weight_scale.item() if weight_scale.numel() == 1 else weight_scale
 	return weight_scale
+
+
+def _get_lora_signature(model_patcher):
+	if not hasattr(model_patcher, "get_attachment"):
+		return ()
+	signature = model_patcher.get_attachment(INT8_LORA_SIGNATURE_ATTACHMENT_KEY)
+	return signature if isinstance(signature, tuple) else ()
+
+
+def _append_lora_signature(model_patcher, mode, lora_name, strength, seed):
+	if not hasattr(model_patcher, "set_attachments"):
+		return
+	signature = _get_lora_signature(model_patcher)
+	model_patcher.set_attachments(
+		INT8_LORA_SIGNATURE_ATTACHMENT_KEY,
+		signature + ((mode, str(lora_name).replace("\\", "/"), float(strength), int(seed)),),
+	)
 
 
 def _mark_deferred_int8_patch(adapter):
@@ -138,7 +156,18 @@ def _create_stochastic_stack_adapter(patches, weight_scale, seed, outlier_method
 	return merged_adapter
 
 
-def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache):
+def _model_has_quantized_int8_modules(model_patcher):
+	diffusion_model = getattr(model_patcher.model, "diffusion_model", None)
+	if diffusion_model is None:
+		return False
+
+	for _module_name, module in diffusion_model.named_modules():
+		if getattr(module, "_is_quantized", False):
+			return True
+	return False
+
+
+def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache, defer_unquantized=True):
 	final_patch_dict = {}
 	applied_count = 0
 
@@ -160,13 +189,15 @@ def _upgrade_patch_dict_for_int8(model_patcher, patch_dict, seed, module_cache):
 						hadanorm_sigma=hadanorm_sigma,
 						defer_until_quantized=False,
 					)
-				else:
+				elif defer_unquantized:
 					final_patch_dict[key] = _wrap_adapter_for_stochastic(
 						adapter,
 						1.0,
 						seed,
 						defer_until_quantized=True,
 					)
+				else:
+					final_patch_dict[key] = adapter
 				applied_count += 1
 			else:
 				final_patch_dict[key] = adapter
@@ -186,7 +217,27 @@ def _dispatch_dynamic_stack(model, kwargs):
 	return INT8DynamicLoraStack().apply_stack(model, **kwargs)
 
 
-def _dispatch_standard_single(model, lora_name, strength):
+def _dispatch_standard_single(model, lora_name, strength, seed=318008):
+	if _model_has_quantized_int8_modules(model):
+		lora_path = folder_paths.get_full_path("loras", lora_name)
+		lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+		model_patcher = model.clone()
+		key_map = _get_key_map(model_patcher)
+		patch_dict = comfy.lora.load_lora(lora, key_map, log_missing=True)
+		del lora
+
+		final_patch_dict, applied_count = _upgrade_patch_dict_for_int8(
+			model_patcher=model_patcher,
+			patch_dict=patch_dict,
+			seed=seed,
+			module_cache={},
+			defer_unquantized=False,
+		)
+		model_patcher.add_patches(final_patch_dict, strength)
+		_append_lora_signature(model_patcher, LORA_MODE_STANDARD, lora_name, strength, seed)
+		print(f"[INT8 LoRA:{LORA_MODE_STANDARD}] Patched {applied_count} INT8-aware layers.")
+		return (model_patcher,)
+
 	lora_path = folder_paths.get_full_path("loras", lora_name)
 	lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
 	model_patcher, _ = comfy.sd.load_lora_for_models(model, None, lora, strength, 0)
@@ -204,10 +255,10 @@ def _collect_lora_entries(kwargs):
 	return lora_entries
 
 
-def _dispatch_standard_stack(model, lora_entries):
+def _dispatch_standard_stack(model, lora_entries, seed=318008):
 	model_patcher = model
 	for lora_name, strength in lora_entries:
-		model_patcher = _dispatch_standard_single(model_patcher, lora_name, strength)[0]
+		model_patcher = _dispatch_standard_single(model_patcher, lora_name, strength, seed=seed)[0]
 	return (model_patcher,)
 
 
@@ -308,7 +359,7 @@ class INT8LoraLoaderStack:
 			return (model,)
 
 		if mode == LORA_MODE_STANDARD:
-			return _dispatch_standard_stack(model, lora_entries)
+			return _dispatch_standard_stack(model, lora_entries, seed=seed)
 
 		if len(lora_entries) == 1:
 			lora_name, strength = lora_entries[0]

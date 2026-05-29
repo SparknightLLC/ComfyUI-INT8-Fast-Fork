@@ -42,12 +42,24 @@ except Exception:
 	comfy_torch_compile = None
 	_TORCH_COMPILE_HELPER_AVAILABLE = False
 
+try:
+	from comfy.weight_adapter.lora import LoRAAdapter
+	from comfy.weight_adapter.base import WeightAdapterBase
+	_WEIGHT_ADAPTER_AVAILABLE = True
+except Exception:
+	LoRAAdapter = None
+	WeightAdapterBase = None
+	_WEIGHT_ADAPTER_AVAILABLE = False
+
 
 AUTO_MODEL_TYPE = "auto"
 NONE_MODEL_TYPE = "none"
 MODEL_TYPE_CHOICES = [AUTO_MODEL_TYPE] + LOADER_MODEL_TYPE_CHOICES + [NONE_MODEL_TYPE]
 _INT8_MODEL_ADAPTER_WRAPPER_KEY = "int8_model_adapter_cache_notice"
 _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY = "int8_model_adapter_original_modules"
+_INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY = "int8_model_adapter_output_cache"
+_INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
+_INT8_MODEL_ADAPTER_OUTPUT_CACHE = {}
 
 MODEL_TYPE_FINGERPRINTS = {
 	"flux2": (
@@ -600,6 +612,94 @@ def _drop_torch_compile_wrapper(model_patcher):
 	return isinstance(compile_kwargs, dict)
 
 
+def _get_lora_signature(model_patcher):
+	if not hasattr(model_patcher, "get_attachment"):
+		return None
+	signature = model_patcher.get_attachment(_INT8_LORA_SIGNATURE_ATTACHMENT_KEY)
+	return signature if isinstance(signature, tuple) else None
+
+
+def _can_cache_adapter_output(model_patcher, lora_signature):
+	if lora_signature is not None:
+		return True
+	return len(getattr(model_patcher, "patches", {})) == 0
+
+
+def _build_adapter_cache_key(
+	model_patcher,
+	resolved_model_type,
+	model_type,
+	outlier_method,
+	small_batch_fallback,
+	runtime_backend,
+	prepack_int8_weights,
+	bake_loaded_loras,
+	fast_unsafe_targeting,
+	lora_signature,
+):
+	if lora_signature is None:
+		lora_signature = ("no_lora_patches",)
+
+	return (
+		"v3",
+		id(getattr(model_patcher, "model", None)),
+		tuple(lora_signature),
+		str(resolved_model_type),
+		str(model_type),
+		str(outlier_method),
+		str(small_batch_fallback),
+		str(runtime_backend),
+		bool(prepack_int8_weights),
+		bool(bake_loaded_loras),
+		bool(fast_unsafe_targeting),
+	)
+
+
+def _get_output_cache(shared_model):
+	cache = getattr(shared_model, _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY, None)
+	if not isinstance(cache, dict):
+		cache = _INT8_MODEL_ADAPTER_OUTPUT_CACHE
+		setattr(shared_model, _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY, cache)
+	return cache
+
+
+def _normalize_runtime_backend(runtime_backend):
+	return runtime_backend if runtime_backend in INT8_BACKEND_CHOICES else DEFAULT_INT8_BACKEND
+
+
+def _normalize_small_batch_fallback(small_batch_fallback):
+	return small_batch_fallback if small_batch_fallback in SMALL_BATCH_FALLBACK_CHOICES else DEFAULT_SMALL_BATCH_FALLBACK
+
+
+def _get_current_int8_runtime_settings():
+	return (
+		_normalize_small_batch_fallback(
+			getattr(Int8TensorwiseOps, "small_batch_fallback_mode", DEFAULT_SMALL_BATCH_FALLBACK)
+		),
+		_normalize_runtime_backend(
+			getattr(Int8TensorwiseOps, "runtime_backend", DEFAULT_INT8_BACKEND)
+		),
+		bool(getattr(Int8TensorwiseOps, "prepack_int8_weights", False)),
+	)
+
+
+def _apply_int8_runtime_settings(small_batch_fallback, runtime_backend, prepack_int8_weights):
+	runtime_backend = _normalize_runtime_backend(runtime_backend)
+	small_batch_fallback = _normalize_small_batch_fallback(small_batch_fallback)
+	Int8TensorwiseOps.small_batch_fallback_mode = small_batch_fallback
+	Int8TensorwiseOps.runtime_backend = runtime_backend
+	Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
+	Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
+	Int8TensorwiseOps.prepack_int8_weights = bool(prepack_int8_weights)
+
+
+def _remember_cached_output(shared_model, cache_key, model_patcher):
+	cache = _get_output_cache(shared_model)
+	cache[cache_key] = model_patcher
+	while len(cache) > 8:
+		cache.pop(next(iter(cache)))
+
+
 def _collect_int8_candidates(diffusion_model, excluded_names, fast_unsafe=False):
 	is_supported = _is_supported_linear_fast_unsafe if fast_unsafe else _is_supported_linear
 	return [
@@ -609,6 +709,227 @@ def _collect_int8_candidates(diffusion_model, excluded_names, fast_unsafe=False)
 		and not _is_excluded(module_name, excluded_names)
 		and is_supported(module)
 	]
+
+
+def _collect_existing_int8_modules(diffusion_model, excluded_names):
+	return [
+		(module_name, module)
+		for module_name, module in diffusion_model.named_modules()
+		if module_name
+		and not _is_excluded(module_name, excluded_names)
+		and isinstance(module, Int8TensorwiseOps.Linear)
+		and getattr(module, "_is_quantized", False)
+	]
+
+
+def _get_int8_patch_weight_scale(q_module):
+	weight_scale = getattr(q_module, "weight_scale", None)
+	if isinstance(weight_scale, torch.Tensor):
+		return weight_scale.item() if weight_scale.numel() == 1 else weight_scale
+	return weight_scale
+
+
+def _wrap_existing_int8_patch(q_module, patch_obj, seed):
+	if not _WEIGHT_ADAPTER_AVAILABLE or not isinstance(patch_obj, WeightAdapterBase):
+		return patch_obj, False
+
+	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
+
+	weight_scale = _get_int8_patch_weight_scale(q_module)
+	outlier_method = getattr(q_module, "_outlier_method", None)
+	hadanorm_sigma = getattr(q_module, "hadanorm_sigma", None)
+
+	if isinstance(patch_obj, INT8MergedLoRAPatchAdapter):
+		return (
+			INT8MergedLoRAPatchAdapter(
+				patch_obj.patches,
+				weight_scale,
+				seed=patch_obj.seed,
+				outlier_method=outlier_method,
+				hadanorm_sigma=hadanorm_sigma,
+			),
+			True,
+		)
+
+	if isinstance(patch_obj, INT8WeightPatchAdapter):
+		return (
+			INT8WeightPatchAdapter(
+				patch_obj.base_adapter,
+				weight_scale,
+				seed=patch_obj.seed,
+				outlier_method=outlier_method,
+				hadanorm_sigma=hadanorm_sigma,
+			),
+			True,
+		)
+
+	if isinstance(patch_obj, INT8LoRAPatchAdapter):
+		return (
+			INT8LoRAPatchAdapter(
+				patch_obj.loaded_keys,
+				patch_obj.weights,
+				weight_scale,
+				seed=patch_obj.seed,
+				outlier_method=outlier_method,
+				hadanorm_sigma=hadanorm_sigma,
+			),
+			True,
+		)
+
+	if isinstance(patch_obj, LoRAAdapter):
+		return (
+			INT8LoRAPatchAdapter(
+				patch_obj.loaded_keys,
+				patch_obj.weights,
+				weight_scale,
+				seed=seed,
+				outlier_method=outlier_method,
+				hadanorm_sigma=hadanorm_sigma,
+			),
+			True,
+		)
+
+	return (
+		INT8WeightPatchAdapter(
+			patch_obj,
+			weight_scale,
+			seed=seed,
+			outlier_method=outlier_method,
+			hadanorm_sigma=hadanorm_sigma,
+		),
+		True,
+	)
+
+
+def _set_existing_int8_weight(q_module, new_weight):
+	if hasattr(q_module, "_replace_weight"):
+		q_module._replace_weight(new_weight)
+	else:
+		q_module.weight = nn.Parameter(new_weight, requires_grad=False)
+		q_module.weight_packed = (
+			q_module.weight.detach().T.contiguous()
+			if Int8TensorwiseOps.prepack_int8_weights
+			else None
+		)
+
+
+def _clone_existing_int8_module(q_module):
+	cloned_module = Int8TensorwiseOps.Linear(
+		q_module.in_features,
+		q_module.out_features,
+		bias=q_module.bias is not None,
+		device=torch.device("meta"),
+	)
+	cloned_module.weight = nn.Parameter(q_module.weight.detach().clone(), requires_grad=False)
+	cloned_module.weight_scale = (
+		q_module.weight_scale.detach().clone()
+		if isinstance(q_module.weight_scale, torch.Tensor)
+		else q_module.weight_scale
+	)
+	cloned_module.weight_packed = (
+		cloned_module.weight.detach().T.contiguous()
+		if Int8TensorwiseOps.prepack_int8_weights
+		else None
+	)
+	cloned_module.quarot_hadamard = (
+		q_module.quarot_hadamard.detach().clone()
+		if isinstance(q_module.quarot_hadamard, torch.Tensor)
+		else None
+	)
+	cloned_module.hadanorm_sigma = (
+		q_module.hadanorm_sigma.detach().clone()
+		if isinstance(q_module.hadanorm_sigma, torch.Tensor)
+		else None
+	)
+	cloned_module._is_quantized = bool(getattr(q_module, "_is_quantized", False))
+	cloned_module._is_per_row = bool(getattr(q_module, "_is_per_row", False))
+	cloned_module._use_quarot = bool(getattr(q_module, "_use_quarot", False))
+	cloned_module._outlier_method = getattr(q_module, "_outlier_method", OUTLIER_METHOD_NONE)
+	cloned_module.compute_dtype = getattr(q_module, "compute_dtype", torch.bfloat16)
+	cloned_module.dynamic_lora_entries = None
+	cloned_module.lora_A = None
+	cloned_module.lora_B = None
+	cloned_module.lora_alpha = None
+
+	if q_module.bias is not None:
+		cloned_module.bias = nn.Parameter(q_module.bias.detach().clone(), requires_grad=False)
+	else:
+		cloned_module.bias = None
+
+	cloned_module.train(q_module.training)
+	return cloned_module
+
+
+def _configure_existing_int8_patches(model_patcher, existing_modules, bake_loaded_loras):
+	configured_count = 0
+	baked_count = 0
+
+	for module_name, q_module in existing_modules:
+		layer_patch_keys = _collect_layer_patch_keys(model_patcher, module_name)
+		if not layer_patch_keys:
+			continue
+
+		target_module = q_module
+		bake_module = None
+		_configure_deferred_int8_patches(model_patcher, layer_patch_keys, q_module)
+		for patch_key in layer_patch_keys:
+			patch_entries = model_patcher.patches.get(patch_key, [])
+			if not patch_entries:
+				continue
+
+			updated_entries = []
+			patch_seed = comfy.utils.string_to_seed(str(_patch_base_key(patch_key)))
+			for patch_entry in patch_entries:
+				if not isinstance(patch_entry, tuple) or len(patch_entry) < 5:
+					updated_entries.append(patch_entry)
+					continue
+
+				strength_patch, patch_obj, strength_model, offset, function = patch_entry
+				if _is_deferred_int8_stochastic_patch(patch_entry):
+					updated_entries.append(patch_entry)
+					continue
+
+				wrapped_patch_obj, was_wrapped = _wrap_existing_int8_patch(target_module, patch_obj, patch_seed)
+				if was_wrapped:
+					configured_count += 1
+				updated_entries.append((strength_patch, wrapped_patch_obj, strength_model, offset, function))
+
+			if bake_loaded_loras:
+				if bake_module is None:
+					bake_module = _clone_existing_int8_module(q_module)
+					target_module = bake_module
+					model_patcher.add_object_patch(_module_patch_key(module_name), bake_module)
+
+				weight = getattr(target_module, "weight", None)
+				if not isinstance(weight, torch.Tensor):
+					model_patcher.patches[patch_key] = updated_entries
+					continue
+
+				compute_device = _get_int8_compute_device(weight.device)
+				try:
+					intermediate_dtype = comfy.model_management.lora_compute_dtype(compute_device)
+				except Exception:
+					intermediate_dtype = torch.float32
+				if _is_float8_dtype(intermediate_dtype):
+					intermediate_dtype = torch.float16
+
+				try:
+					baked_weight = comfy.lora.calculate_weight(
+						updated_entries,
+						weight.detach().clone(),
+						_module_weight_key(module_name),
+						intermediate_dtype=intermediate_dtype,
+					)
+					_set_existing_int8_weight(target_module, baked_weight.detach())
+					model_patcher.patches.pop(patch_key, None)
+					baked_count += len(updated_entries)
+				except Exception as e:
+					logging.warning(f"INT8 Model Adapter: failed to bake existing INT8 patches for {module_name} ({e}).")
+					model_patcher.patches[patch_key] = updated_entries
+			else:
+				model_patcher.patches[patch_key] = updated_entries
+
+	return configured_count, baked_count
 
 
 def _get_original_module_cache(model_patcher):
@@ -746,8 +1067,41 @@ class INT8ModelAdapter:
 			bool(log_progress),
 		)
 		fast_unsafe_targeting = resolved_model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE
-		if runtime_backend not in INT8_BACKEND_CHOICES:
-			runtime_backend = DEFAULT_INT8_BACKEND
+		small_batch_fallback = _normalize_small_batch_fallback(small_batch_fallback)
+		runtime_backend = _normalize_runtime_backend(runtime_backend)
+		prior_small_batch_fallback, prior_runtime_backend, prior_prepack_int8_weights = _get_current_int8_runtime_settings()
+
+		source_existing_int8_modules = _collect_existing_int8_modules(source_diffusion_model, excluded_names)
+		source_has_quantizable_candidates = bool(_collect_int8_candidates(
+			source_diffusion_model,
+			excluded_names,
+			fast_unsafe=fast_unsafe_targeting,
+		))
+		preserve_existing_runtime = bool(source_existing_int8_modules) and not source_has_quantizable_candidates
+		effective_small_batch_fallback = prior_small_batch_fallback if preserve_existing_runtime else small_batch_fallback
+		effective_runtime_backend = prior_runtime_backend if preserve_existing_runtime else runtime_backend
+		effective_prepack_int8_weights = prior_prepack_int8_weights if preserve_existing_runtime else bool(prepack_int8_weights)
+
+		lora_signature = _get_lora_signature(source_model_patcher)
+		use_output_cache = _can_cache_adapter_output(source_model_patcher, lora_signature)
+		adapter_cache_key = _build_adapter_cache_key(
+			source_model_patcher,
+			resolved_model_type,
+			model_type,
+			outlier_method,
+			effective_small_batch_fallback,
+			effective_runtime_backend,
+			effective_prepack_int8_weights,
+			bake_loaded_loras,
+			fast_unsafe_targeting,
+			lora_signature,
+		)
+		if use_output_cache:
+			cached_model_patcher = _get_output_cache(source_model_patcher.model).get(adapter_cache_key)
+			if cached_model_patcher is not None:
+				if log_progress:
+					print("[INT8 Model Adapter] Reusing cached baked INT8 MODEL output.")
+				return (cached_model_patcher,)
 
 		model_patcher = source_model_patcher.clone()
 		restored_prior_patch_count = _reset_prior_int8_object_patches(model_patcher)
@@ -757,16 +1111,27 @@ class INT8ModelAdapter:
 			logging.warning("INT8 Model Adapter: model has no diffusion_model; returning unchanged model.")
 			return (model_patcher,)
 
-		Int8TensorwiseOps.small_batch_fallback_mode = small_batch_fallback
-		Int8TensorwiseOps.runtime_backend = runtime_backend
-		Int8TensorwiseOps.runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
-		Int8TensorwiseOps.runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
-		Int8TensorwiseOps.prepack_int8_weights = bool(prepack_int8_weights)
+		_apply_int8_runtime_settings(
+			effective_small_batch_fallback,
+			effective_runtime_backend,
+			effective_prepack_int8_weights,
+		)
 
 		if log_progress and fast_unsafe_targeting:
 			print(
 				"[INT8 Model Adapter] flux2_fast_unsafe selected; using upstream-style plain nn.Linear "
 				"targeting and the less conservative Flux2 exclusion preset."
+			)
+		if log_progress and preserve_existing_runtime and (
+			effective_runtime_backend != runtime_backend
+			or effective_small_batch_fallback != small_batch_fallback
+			or effective_prepack_int8_weights != bool(prepack_int8_weights)
+		):
+			print(
+				"[INT8 Model Adapter] Preserving existing INT8 runtime settings from loader "
+				f"(backend={effective_runtime_backend}, "
+				f"small_batch_fallback={effective_small_batch_fallback}, "
+				f"prepack_int8_weights={effective_prepack_int8_weights})."
 			)
 
 		candidates = _collect_int8_candidates(
@@ -774,7 +1139,8 @@ class INT8ModelAdapter:
 			excluded_names,
 			fast_unsafe=fast_unsafe_targeting,
 		)
-		if not candidates:
+		existing_int8_modules = _collect_existing_int8_modules(diffusion_model, excluded_names)
+		if not candidates and not existing_int8_modules:
 			try:
 				if log_progress:
 					print("[INT8 Model Adapter] No eligible layers found on first scan; forcing model load and rescanning.")
@@ -785,6 +1151,17 @@ class INT8ModelAdapter:
 					excluded_names,
 					fast_unsafe=fast_unsafe_targeting,
 				)
+				existing_int8_modules = _collect_existing_int8_modules(diffusion_model, excluded_names)
+				if existing_int8_modules and not candidates and not preserve_existing_runtime:
+					preserve_existing_runtime = True
+					effective_small_batch_fallback = prior_small_batch_fallback
+					effective_runtime_backend = prior_runtime_backend
+					effective_prepack_int8_weights = prior_prepack_int8_weights
+					_apply_int8_runtime_settings(
+						effective_small_batch_fallback,
+						effective_runtime_backend,
+						effective_prepack_int8_weights,
+					)
 			except Exception as e:
 				logging.warning(f"INT8 Model Adapter: forced model load failed during candidate scan ({e}).")
 
@@ -805,14 +1182,27 @@ class INT8ModelAdapter:
 
 		total = len(candidates)
 		quantized = 0
+		existing_quantized = len(existing_int8_modules)
 		quarot_count = 0
 		baked_lora_count = 0
+		configured_int8_patch_count, baked_existing_int8_patch_count = _configure_existing_int8_patches(
+			model_patcher,
+			existing_int8_modules,
+			bool(bake_loaded_loras),
+		)
+		baked_lora_count += baked_existing_int8_patch_count
 		skipped_patched_count = 0
 		last_bucket = -1
 
 		if log_progress:
 			if restored_prior_patch_count:
 				print(f"[INT8 Model Adapter] Restored {restored_prior_patch_count} prior INT8 object patches before requantizing.")
+			if existing_quantized:
+				print(
+					f"[INT8 Model Adapter] Found {existing_quantized} existing INT8 layer(s); "
+					f"baked {baked_existing_int8_patch_count} and configured "
+					f"{max(0, configured_int8_patch_count - baked_existing_int8_patch_count)} pending patch(es)."
+				)
 			print(f"[INT8 Model Adapter] Starting MODEL quantization (eligible linear layers: {total})")
 
 		for index, (module_name, module) in enumerate(candidates, start=1):
@@ -877,29 +1267,54 @@ class INT8ModelAdapter:
 			"requested_model_type": model_type,
 			"bake_loaded_loras": bool(bake_loaded_loras),
 			"outlier_method": outlier_method,
-			"small_batch_fallback": small_batch_fallback,
-			"runtime_backend": runtime_backend,
-			"prepack_int8_weights": bool(prepack_int8_weights),
+			"small_batch_fallback": effective_small_batch_fallback,
+			"runtime_backend": effective_runtime_backend,
+			"prepack_int8_weights": bool(effective_prepack_int8_weights),
+			"requested_small_batch_fallback": small_batch_fallback,
+			"requested_runtime_backend": runtime_backend,
+			"requested_prepack_int8_weights": bool(prepack_int8_weights),
+			"preserved_existing_runtime": bool(preserve_existing_runtime),
 			"fast_unsafe_targeting": bool(fast_unsafe_targeting),
 			"log_progress": bool(log_progress),
-			"quantized_layers": quantized,
+			"quantized_layers": quantized + existing_quantized,
+			"new_quantized_layers": quantized,
+			"existing_quantized_layers": existing_quantized,
 			"baked_lora_layers": baked_lora_count,
+			"baked_existing_int8_patches": baked_existing_int8_patch_count,
+			"configured_int8_patch_layers": configured_int8_patch_count,
 			"outlier_adjusted_layers": quarot_count,
 			"skipped_patched_layers": skipped_patched_count,
 		}
 		setattr(diffusion_model, "_int8_model_adapter_skip_cache_notice_once", True)
 		compile_wrapper_removed = _drop_torch_compile_wrapper(model_patcher)
 		_ensure_int8_model_adapter_notice_wrapper(model_patcher)
-		model_patcher.patches_uuid = uuid.uuid4()
+		if use_output_cache:
+			adapter_cache_key = _build_adapter_cache_key(
+				source_model_patcher,
+				resolved_model_type,
+				model_type,
+				outlier_method,
+				effective_small_batch_fallback,
+				effective_runtime_backend,
+				effective_prepack_int8_weights,
+				bake_loaded_loras,
+				fast_unsafe_targeting,
+				lora_signature,
+			)
+			model_patcher.patches_uuid = uuid.uuid5(uuid.NAMESPACE_URL, repr(adapter_cache_key))
+			_remember_cached_output(source_model_patcher.model, adapter_cache_key, model_patcher)
+		else:
+			model_patcher.patches_uuid = uuid.uuid4()
 		_cleanup_torch_memory()
 
 		if log_progress:
 			print(
 				"[INT8 Model Adapter] Complete "
-				f"(quantized={quantized}, baked_patches={baked_lora_count}, "
+				f"(quantized={quantized}, existing_int8={existing_quantized}, "
+				f"baked_patches={baked_lora_count}, configured_int8_patches={configured_int8_patch_count}, "
 				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count}, "
-				f"backend={runtime_backend}, small_batch_fallback={small_batch_fallback}, "
-				f"prepack_int8_weights={bool(prepack_int8_weights)})"
+				f"backend={effective_runtime_backend}, small_batch_fallback={effective_small_batch_fallback}, "
+				f"prepack_int8_weights={bool(effective_prepack_int8_weights)})"
 			)
 			if compile_wrapper_removed:
 				print("[INT8 Model Adapter] Removed torch.compile wrapper after requantization.")
