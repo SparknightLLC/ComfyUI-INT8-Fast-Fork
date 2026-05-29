@@ -1,4 +1,6 @@
+import gc
 import logging
+import os
 
 import comfy.patcher_extension
 import comfy.utils
@@ -10,6 +12,11 @@ _TORCH_COMPILE_KWARGS = "torch_compile_kwargs"
 _WHOLE_MODEL_COMPILE_KEY_LIST = ["diffusion_model"]
 _LAZY_COMPILE_OUTPUT_CACHE_KEY = "int8_lazy_compile_output_cache"
 _LAZY_COMPILE_OUTPUT_CACHE = {}
+try:
+	_LAZY_COMPILE_OUTPUT_CACHE_LIMIT = max(0, int(os.environ.get("INT8_LAZY_COMPILE_OUTPUT_CACHE_LIMIT", "1")))
+except ValueError:
+	_LAZY_COMPILE_OUTPUT_CACHE_LIMIT = 1
+_LAZY_COMPILE_RESET_ON_EVICT = os.environ.get("INT8_LAZY_COMPILE_RESET_ON_EVICT", "1") == "1"
 
 
 def _skip_transformer_options_guards(guard_entries):
@@ -112,7 +119,7 @@ def _build_cache_key(
 	log_compile,
 ):
 	return (
-		"v1",
+		"v2",
 		id(getattr(model_patcher, "model", None)),
 		getattr(model_patcher, "patches_uuid", None),
 		str(backend),
@@ -127,11 +134,53 @@ def _build_cache_key(
 	)
 
 
+def _cleanup_compile_memory(reset_compile_cache=False):
+	try:
+		gc.collect()
+	except Exception:
+		pass
+
+	if reset_compile_cache:
+		try:
+			torch._dynamo.reset()
+		except Exception:
+			pass
+
+	if torch.cuda.is_available():
+		try:
+			torch.cuda.empty_cache()
+		except Exception:
+			pass
+
+
+def _dispose_cached_output(model_patcher):
+	try:
+		model_patcher.remove_wrappers_with_key(
+			comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+			_LAZY_COMPILE_WRAPPER_KEY,
+		)
+	except Exception:
+		pass
+	try:
+		model_patcher.model_options.pop(_TORCH_COMPILE_KWARGS, None)
+	except Exception:
+		pass
+	_cleanup_compile_memory(reset_compile_cache=_LAZY_COMPILE_RESET_ON_EVICT)
+
+
 def _remember_cached_output(shared_model, cache_key, model_patcher):
+	if _LAZY_COMPILE_OUTPUT_CACHE_LIMIT <= 0:
+		return
+
 	cache = _get_output_cache(shared_model)
 	cache[cache_key] = model_patcher
-	while len(cache) > 8:
-		cache.pop(next(iter(cache)))
+	while len(cache) > _LAZY_COMPILE_OUTPUT_CACHE_LIMIT:
+		old_key = next(iter(cache))
+		if old_key == cache_key and len(cache) > 1:
+			old_key = next(key for key in cache if key != cache_key)
+		evicted_model_patcher = cache.pop(old_key)
+		if evicted_model_patcher is not model_patcher:
+			_dispose_cached_output(evicted_model_patcher)
 
 
 def _make_lazy_compile_wrapper(compile_key_list, compile_kwargs, log_compile):
@@ -220,9 +269,10 @@ class INT8LazyTorchCompile:
 			disable_dynamic_vram,
 			log_compile,
 		)
-		cached_model_patcher = _get_output_cache(model.model).get(cache_key)
-		if cached_model_patcher is not None:
-			return (cached_model_patcher,)
+		if _LAZY_COMPILE_OUTPUT_CACHE_LIMIT > 0:
+			cached_model_patcher = _get_output_cache(model.model).get(cache_key)
+			if cached_model_patcher is not None:
+				return (cached_model_patcher,)
 
 		try:
 			model_patcher = model.clone(disable_dynamic=bool(disable_dynamic_vram))
